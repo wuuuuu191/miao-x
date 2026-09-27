@@ -87,7 +87,7 @@ docker compose up -d --build
 miaowu -c config.yaml   # mode: master，浏览器打开 http://127.0.0.1:12889
 ```
 
-### 6. 面板域名与 SSL
+### 6. 面板域名与 SSL（3X-UI 式证书模式）
 
 三种方式任选：
 

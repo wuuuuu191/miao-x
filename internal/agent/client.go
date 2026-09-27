@@ -37,6 +37,7 @@ const (
 	MsgRPCReply     = "rpc_reply"
 	MsgConfigUpdate = "config_update"
 	MsgConfigAck    = "config_ack"
+	MsgUserSync     = "user_sync" // master→agent: 需下线的 client email 名单
 	MsgTokenUpdate  = "token_update"
 )
 
@@ -78,6 +79,9 @@ type Client struct {
 
 	lastRev atomic.Int64 // 已应用的最大配置 revision（防旧配置乱序覆盖）
 
+	disabled   map[string]bool // 已下线 client email（配额/禁用）
+	disabledMu sync.Mutex
+
 	lastNetSample struct {
 		rx, tx int64
 		at     time.Time
@@ -88,7 +92,7 @@ type Client struct {
 }
 
 func NewClient(cfg Config, mux *http.ServeMux) *Client {
-	return &Client{
+	c := &Client{
 		cfg:          cfg,
 		mux:          mux,
 		stopCh:       make(chan struct{}),
@@ -97,7 +101,10 @@ func NewClient(cfg Config, mux *http.ServeMux) *Client {
 		pendingDown:  map[string]int64{},
 		inflightUp:   map[string]int64{},
 		inflightDown: map[string]int64{},
+		disabled:     map[string]bool{},
 	}
+	c.loadDisabled()
+	return c
 }
 
 func (c *Client) Stop() { c.once.Do(func() { close(c.stopCh) }) }
@@ -344,12 +351,6 @@ func (c *Client) messageLoop(ws *websocket.Conn) error {
 			case MsgHeartbeatAck:
 			case MsgRegisterAck:
 				log.Printf("[Agent] 注册成功")
-				var p struct {
-					ConfigRevision int64 `json:"config_revision"`
-				}
-				if json.Unmarshal(env.Payload, &p) == nil && p.ConfigRevision >= 0 {
-					c.lastRev.Store(p.ConfigRevision)
-				}
 			case MsgTokenUpdate:
 				var p struct {
 					Token string `json:"token"`
@@ -361,6 +362,8 @@ func (c *Client) messageLoop(ws *websocket.Conn) error {
 				}
 			case MsgConfigUpdate:
 				go c.handleConfigUpdate(ws, env.Payload)
+			case MsgUserSync:
+				go c.handleUserSync(env.Payload)
 			case MsgRPCCall:
 				go c.handleRPCCall(ws, env.Payload)
 			default:

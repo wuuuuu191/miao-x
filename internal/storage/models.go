@@ -276,6 +276,7 @@ func (s *Store) DeleteServer(id int64) error {
 	s.db.Exec(`DELETE FROM server_status WHERE server_id=?`, id)
 	s.db.Exec(`DELETE FROM server_traffic WHERE server_id=?`, id)
 	s.db.Exec(`DELETE FROM agent_users WHERE server_id=?`, id)
+	s.db.Exec(`DELETE FROM nodes WHERE origin_server_id=?`, id) // 同步节点一并清理
 	_, err := s.db.Exec(`DELETE FROM servers WHERE id=?`, id)
 	return err
 }
@@ -478,6 +479,32 @@ func (s *Store) NodeTrafficMonth() (map[string][2]int64, error) {
 		out[fmt.Sprintf("%d|%s", sid, tag)] = [2]int64{up, down}
 	}
 	return out, rows.Err()
+}
+
+// DisabledEmails 需要在被控机上下线的用户集合：
+//  1. 被管理员禁用（is_active=0）的用户
+//  2. 月配额非零且当月用量已达配额的用户
+//
+// 返回 email 形式（username@panel），与 xray client email 对应。
+func (s *Store) DisabledEmails() ([]string, error) {
+	users, err := s.ListUsers()
+	if err != nil {
+		return nil, err
+	}
+	out := []string{}
+	for _, u := range users {
+		if !u.IsActive {
+			out = append(out, u.Username+"@panel")
+			continue
+		}
+		if u.MonthlyQuota > 0 {
+			up, down, err := s.UserTrafficMonth(u.Username)
+			if err == nil && up+down >= u.MonthlyQuota {
+				out = append(out, u.Username+"@panel")
+			}
+		}
+	}
+	return out, nil
 }
 
 // ---------- agent_users ----------

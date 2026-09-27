@@ -14,6 +14,8 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -37,6 +39,7 @@ const (
 	MsgRPCStreamData = "rpc_stream_data"
 	MsgConfigUpdate  = "config_update"
 	MsgConfigAck     = "config_ack"
+	MsgUserSync      = "user_sync" // master→agent: 需下线的 client email 名单（超配额/禁用）
 	MsgTokenUpdate   = "token_update"
 )
 
@@ -47,16 +50,18 @@ type Envelope struct {
 
 // Conn 一条已认证的 agent 连接。
 type Conn struct {
-	ServerID   int64
-	ServerName string
-	ws         *websocket.Conn
-	session    *securechan.Session
-	sendMu     sync.Mutex
-	hub        *Hub
-	closeCh    chan struct{}
-	closeOnce  sync.Once
-	pendingMu  sync.Mutex
-	pending    map[string]chan *RPCReply
+	ServerID     int64
+	ServerName   string
+	ws           *websocket.Conn
+	session      *securechan.Session
+	sendMu       sync.Mutex
+	hub          *Hub
+	closeCh      chan struct{}
+	closeOnce    sync.Once
+	pendingMu    sync.Mutex
+	pending      map[string]chan *RPCReply
+	disabledMu   sync.Mutex
+	lastDisabled string
 }
 
 // Hub 管理所有在线 agent。
@@ -173,6 +178,16 @@ func (h *Hub) HandleAgentWS(w http.ResponseWriter, r *http.Request) {
 			"revision": server.ConfigRevision, "config": server.DesiredConfig,
 		})}); err == nil {
 			log.Printf("[Hub] 已向 %s 补推配置 rev=%d", server.Name, server.ConfigRevision)
+		}
+	}
+	// 注册后同步当前禁用名单（超配额/被禁用用户）
+	if emails, err := h.store.DisabledEmails(); err == nil {
+		sort.Strings(emails)
+		conn.disabledMu.Lock()
+		conn.lastDisabled = strings.Join(emails, ",")
+		conn.disabledMu.Unlock()
+		if len(emails) > 0 {
+			_ = h.PushUserSync(server.ID, emails)
 		}
 	}
 
@@ -359,6 +374,7 @@ func (c *Conn) run() {
 			var tr TrafficPayload
 			if json.Unmarshal(env.Payload, &tr) == nil {
 				c.handleTraffic(&tr)
+				c.maybePushDisabled() // 流量变化可能触发配额
 			}
 		case MsgSpeed:
 			var sp SpeedPayload
@@ -391,6 +407,25 @@ func (c *Conn) handleTraffic(tr *TrafficPayload) {
 	}
 	for _, ib := range tr.Inbounds {
 		_ = c.hub.store.AddNodeTraffic(c.ServerID, ib.Tag, ib.Up, ib.Down)
+	}
+}
+
+// maybePushDisabled 流量归集后检查配额/禁用名单，变化则推给 agent。
+func (c *Conn) maybePushDisabled() {
+	emails, err := c.hub.store.DisabledEmails()
+	if err != nil {
+		return
+	}
+	sort.Strings(emails)
+	key := strings.Join(emails, ",")
+	c.disabledMu.Lock()
+	changed := key != c.lastDisabled
+	c.lastDisabled = key
+	c.disabledMu.Unlock()
+	if changed {
+		if err := c.hub.PushUserSync(c.ServerID, emails); err == nil {
+			log.Printf("[Hub] %s user_sync: %d 个需下线客户端", c.ServerName, len(emails))
+		}
 	}
 }
 
@@ -489,6 +524,55 @@ func (h *Hub) PushConfig(serverID int64, revision int64, config string) error {
 		"config":   config,
 	})
 	return conn.sendEncrypted(Envelope{Type: MsgConfigUpdate, Payload: payload})
+}
+
+// PushUserSync 把需下线的 client email 名单推给在线 agent。
+func (h *Hub) PushUserSync(serverID int64, emails []string) error {
+	h.mu.RLock()
+	conn, ok := h.conns[serverID]
+	h.mu.RUnlock()
+	if !ok {
+		return errAgentOffline
+	}
+	payload, _ := json.Marshal(map[string]any{"disabled": emails})
+	return conn.sendEncrypted(Envelope{Type: MsgUserSync, Payload: payload})
+}
+
+// PushDisabledAll 向所有在线 agent 推送最新禁用名单（用户禁用/删除后调用）。
+func (h *Hub) PushDisabledAll() {
+	emails, err := h.store.DisabledEmails()
+	if err != nil {
+		return
+	}
+	h.mu.RLock()
+	conns := make([]*Conn, 0, len(h.conns))
+	for _, c := range h.conns {
+		conns = append(conns, c)
+	}
+	h.mu.RUnlock()
+	payload, _ := json.Marshal(map[string]any{"disabled": emails})
+	for _, c := range conns {
+		if err := c.sendEncrypted(Envelope{Type: MsgUserSync, Payload: payload}); err == nil {
+			log.Printf("[Hub] user_sync → %s: %d 个下线客户端", c.ServerName, len(emails))
+		}
+	}
+}
+
+// PushConfigAll 向所有在线 agent 重推其期望配置（用户重新启用后恢复客户端用）。
+func (h *Hub) PushConfigAll() {
+	servers, err := h.store.ListServers()
+	if err != nil {
+		return
+	}
+	for _, sv := range servers {
+		if sv.DesiredConfig == "" {
+			continue
+		}
+		if err := h.PushConfig(sv.ID, sv.ConfigRevision, sv.DesiredConfig); err != nil {
+			continue
+		}
+		log.Printf("[Hub] 重推配置 → %s (rev=%d)", sv.Name, sv.ConfigRevision)
+	}
 }
 
 var (

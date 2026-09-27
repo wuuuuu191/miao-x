@@ -144,19 +144,20 @@ func (c *Client) handleConfigUpdate(ws *websocket.Conn, payload json.RawMessage)
 		log.Printf("[Agent] config_update 解析失败: %v", err)
 		return
 	}
+	cfgPath := filepath.Join(c.cfg.XrayConfigDir, "config.json")
+	// revision 语义 = 已应用版本：小于 applied 忽略；等于 applied 且本地已有配置 → 忽略重复；
+	// 等于但本地无配置文件（全新 agent）→ 仍然应用（S1 补推场景）
+	if p.Revision >= 0 {
+		cur := c.lastRev.Load()
+		_, haveFile := os.Stat(cfgPath)
+		if p.Revision < cur || (p.Revision == cur && haveFile == nil) {
+			log.Printf("[Agent] 忽略重复/旧配置 rev=%d（applied=%d, hasFile=%v）", p.Revision, cur, haveFile == nil)
+			return
+		}
+	}
 	if p.Config == "" {
 		return
 	}
-	// revision 单调：拒绝乱序到达的旧配置（如 WS 重传/快速连续下发时的竞态）
-	if p.Revision >= 0 {
-		cur := c.lastRev.Load()
-		if p.Revision <= cur {
-			log.Printf("[Agent] 忽略旧配置 rev=%d（当前 %d）", p.Revision, cur)
-			return
-		}
-		c.lastRev.Store(p.Revision)
-	}
-	cfgPath := filepath.Join(c.cfg.XrayConfigDir, "config.json")
 	if err := os.MkdirAll(c.cfg.XrayConfigDir, 0755); err != nil {
 		log.Printf("[Agent] 创建配置目录失败: %v", err)
 		return
@@ -167,11 +168,16 @@ func (c *Client) handleConfigUpdate(ws *websocket.Conn, payload json.RawMessage)
 		log.Printf("[Agent] 配置合并失败: %v", err)
 		merged = []byte(p.Config)
 	}
+	// 剥离已下线用户的客户端（配额/禁用）
+	merged = c.stripDisabledClients(merged)
 	if err := os.WriteFile(cfgPath, merged, 0600); err != nil {
 		log.Printf("[Agent] 写配置失败: %v", err)
 		return
 	}
 	_ = os.Chmod(cfgPath, 0600) // 含 Reality 私钥与用户密码（M10）
+	if p.Revision >= 0 {
+		c.lastRev.Store(p.Revision) // 已应用
+	}
 	log.Printf("[Agent] 收到配置 rev=%d，已写入 %s，重启 xray", p.Revision, cfgPath)
 	if err := c.RestartXray(); err != nil {
 		log.Printf("[Agent] xray 重启失败: %v", err)
@@ -182,6 +188,115 @@ func (c *Client) handleConfigUpdate(ws *websocket.Conn, payload json.RawMessage)
 		if err := c.send(ws, Envelope{Type: MsgConfigAck, Payload: ackPayload}); err != nil {
 			log.Printf("[Agent] config_ack 发送失败: %v", err)
 		}
+	}
+}
+
+// ---------- 用户下线（配额/禁用） ----------
+
+// loadDisabled 从 data_dir 读持久化的禁用名单（agent 重启后仍生效）。
+func (c *Client) loadDisabled() {
+	if c.cfg.DataDir == "" {
+		return
+	}
+	data, err := os.ReadFile(filepath.Join(c.cfg.DataDir, "disabled.json"))
+	if err != nil {
+		return
+	}
+	var set map[string]bool
+	if json.Unmarshal(data, &set) == nil {
+		c.disabled = set
+	}
+}
+
+// saveDisabled 持久化禁用名单。
+func (c *Client) saveDisabled(set map[string]bool) {
+	if c.cfg.DataDir == "" {
+		return
+	}
+	data, _ := json.Marshal(set)
+	_ = os.WriteFile(filepath.Join(c.cfg.DataDir, "disabled.json"), data, 0600)
+}
+
+// stripDisabledClients 从配置中移除已下线用户的客户端（vless/trojan/hy2 按 email）。
+func (c *Client) stripDisabledClients(cfgBytes []byte) []byte {
+	if len(c.disabled) == 0 {
+		return cfgBytes
+	}
+	var cfg map[string]any
+	if json.Unmarshal(cfgBytes, &cfg) != nil {
+		return cfgBytes
+	}
+	inbounds, _ := cfg["inbounds"].([]any)
+	changed := false
+	for _, x := range inbounds {
+		ib, ok := x.(map[string]any)
+		if !ok {
+			continue
+		}
+		settings, _ := ib["settings"].(map[string]any)
+		if settings == nil {
+			continue
+		}
+		clients, _ := settings["clients"].([]any)
+		out := []any{}
+		for _, cl := range clients {
+			m, ok := cl.(map[string]any)
+			if !ok {
+				out = append(out, cl)
+				continue
+			}
+			em, _ := m["email"].(string)
+			if c.disabled[em] {
+				changed = true
+				log.Printf("[Agent] 客户端下线生效: %s", em)
+				continue
+			}
+			out = append(out, cl)
+		}
+		settings["clients"] = out
+	}
+	if !changed {
+		return cfgBytes
+	}
+	out, err := json.Marshal(cfg)
+	if err != nil {
+		return cfgBytes
+	}
+	return out
+}
+
+// handleUserSync 应用主控推送的下线名单：持久化 → 从当前生效配置剥离 → 重启 xray。
+func (c *Client) handleUserSync(payload json.RawMessage) {
+	var p struct {
+		Disabled []string `json:"disabled"`
+	}
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return
+	}
+	set := map[string]bool{}
+	for _, e := range p.Disabled {
+		set[e] = true
+	}
+	c.disabledMu.Lock()
+	c.disabled = set
+	c.saveDisabled(set)
+	c.disabledMu.Unlock()
+	log.Printf("[Agent] user_sync: %d 个客户端下线", len(set))
+
+	cfgPath := filepath.Join(c.cfg.XrayConfigDir, "config.json")
+	data, err := os.ReadFile(cfgPath)
+	if err != nil {
+		return
+	}
+	stripped := c.stripDisabledClients(data)
+	if string(stripped) == string(data) {
+		return // 配置无需变化
+	}
+	if err := os.WriteFile(cfgPath, stripped, 0600); err != nil {
+		return
+	}
+	if err := c.RestartXray(); err != nil {
+		log.Printf("[Agent] xray 重启失败: %v", err)
 	}
 }
 

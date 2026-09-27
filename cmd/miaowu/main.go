@@ -268,6 +268,9 @@ func runMaster(cfg Config) {
 			writeErr(w, http.StatusInternalServerError, err.Error())
 			return
 		}
+		// 删除用户：从所有服务器配置中移除其客户端 + 下线名单
+		removeUserClientsFromAllServers(store, hub, p.Username)
+		hub.PushDisabledAll()
 		writeJSON(w, map[string]string{"ok": "deleted"})
 	}))
 	mux.Handle("/api/admin/users/status", auth.Middleware(store, true, func(w http.ResponseWriter, r *http.Request) {
@@ -283,6 +286,11 @@ func runMaster(cfg Config) {
 			writeErr(w, http.StatusInternalServerError, err.Error())
 			return
 		}
+		// 配额/禁用即时生效：禁用推名单，启用重推配置恢复客户端
+		if p.Active {
+			hub.PushConfigAll()
+		}
+		hub.PushDisabledAll()
 		writeJSON(w, map[string]string{"ok": "updated"})
 	}))
 
@@ -645,6 +653,51 @@ func runMaster(cfg Config) {
 				return
 			}
 			writeJSON(w, map[string]string{"token": tok})
+		case "inbounds":
+			// 单入站多用户：查看入站与客户端列表
+			sv, err := store.GetServer(id)
+			if err != nil {
+				writeErr(w, 404, "server not found")
+				return
+			}
+			writeJSON(w, listInbounds(sv))
+		case "clients":
+			// 单入站多用户：POST 添加客户端 / DELETE 移除客户端
+			var p struct {
+				Tag      string `json:"tag"`
+				Username string `json:"username"`
+				Email    string `json:"email"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&p); err != nil || p.Tag == "" {
+				writeErr(w, 400, "bad request")
+				return
+			}
+			sv, err := store.GetServer(id)
+			if err != nil {
+				writeErr(w, 404, "server not found")
+				return
+			}
+			var email, newCfg string
+			if r.Method == http.MethodPost {
+				email, newCfg, err = addClientToInbound(sv, p.Tag, p.Username)
+			} else if r.Method == http.MethodDelete {
+				email, newCfg, err = removeClientFromInbound(sv, p.Tag, p.Email)
+			} else {
+				writeErr(w, 405, "method not allowed")
+				return
+			}
+			if err != nil {
+				writeErr(w, 400, err.Error())
+				return
+			}
+			rev, n, serr := applyConfigChange(store, hub, sv, newCfg)
+			// 客户端增减影响禁用名单归属，推一份最新名单
+			if emails, derr := store.DisabledEmails(); derr == nil {
+				if perr := hub.PushUserSync(id, emails); perr != nil {
+					log.Printf("[Master] user_sync 推送失败(离线): %v", perr)
+				}
+			}
+			writeJSON(w, map[string]any{"email": email, "revision": rev, "synced_nodes": n, "sync_error": errStr(serr)})
 		case "generate-node":
 			// 在该 agent 机上生成节点：生成凭据 → 追加 inbound → 下发 → 同步到订阅
 			var spec generateSpec

@@ -6,11 +6,13 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"log"
 	"strconv"
 	"strings"
 
 	"golang.org/x/crypto/curve25519"
 
+	"miao-x/internal/master"
 	"miao-x/internal/securechan"
 	"miao-x/internal/storage"
 	"miao-x/internal/subparser"
@@ -172,9 +174,164 @@ func randomHex(n int) string {
 	return string(out)
 }
 
-// ---------- 入站 → 订阅节点 同步器 ----------
+// ---------- 入站客户端管理（单入站多用户） ----------
 
-// syncServerNodes 把服务器 desired_config 的入站转成订阅节点（全局池），delete+insert 幂等。
+type inboundInfo struct {
+	Tag      string   `json:"tag"`
+	Protocol string   `json:"protocol"`
+	Port     int      `json:"port"`
+	Clients  []string `json:"clients"` // email 列表
+}
+
+// listInbounds 解析服务器配置中的入站与客户端。
+func listInbounds(sv *storage.Server) []inboundInfo {
+	if strings.TrimSpace(sv.DesiredConfig) == "" {
+		return nil
+	}
+	var cfg struct {
+		Inbounds []map[string]any `json:"inbounds"`
+	}
+	if json.Unmarshal([]byte(sv.DesiredConfig), &cfg) != nil {
+		return nil
+	}
+	out := []inboundInfo{}
+	for _, ib := range cfg.Inbounds {
+		proto, _ := ib["protocol"].(string)
+		tag, _ := ib["tag"].(string)
+		portF, _ := ib["port"].(float64)
+		if proto == "dokodemo-door" {
+			continue
+		}
+		info := inboundInfo{Tag: tag, Protocol: proto, Port: int(portF), Clients: []string{}}
+		if settings, ok := ib["settings"].(map[string]any); ok {
+			if cs, ok := settings["clients"].([]any); ok {
+				for _, c := range cs {
+					if m, ok := c.(map[string]any); ok {
+						if em, _ := m["email"].(string); em != "" {
+							info.Clients = append(info.Clients, em)
+						}
+					}
+				}
+			}
+		}
+		out = append(out, info)
+	}
+	return out
+}
+
+// addClientToInbound 给指定入站追加一个客户端（自动生成凭据）。
+// 返回新 email 与更新后的完整配置 JSON。
+func addClientToInbound(sv *storage.Server, tag, username string) (string, string, error) {
+	if username == "" {
+		return "", "", fmt.Errorf("用户名不能为空")
+	}
+	email := username + "@panel"
+	var cfg map[string]any
+	if sv.DesiredConfig == "" || json.Unmarshal([]byte(sv.DesiredConfig), &cfg) != nil {
+		return "", "", fmt.Errorf("该服务器还没有配置")
+	}
+	inbounds, _ := cfg["inbounds"].([]any)
+	for _, x := range inbounds {
+		ib, ok := x.(map[string]any)
+		if !ok || ib["tag"] != tag {
+			continue
+		}
+		settings, _ := ib["settings"].(map[string]any)
+		if settings == nil {
+			return "", "", fmt.Errorf("入站 %s 缺少 settings", tag)
+		}
+		clients, _ := settings["clients"].([]any)
+		for _, c := range clients {
+			if m, ok := c.(map[string]any); ok && m["email"] == email {
+				return "", "", fmt.Errorf("客户端已存在: %s", email)
+			}
+		}
+		switch ib["protocol"] {
+		case "vless":
+			nc := map[string]any{"id": uuidV4(), "email": email}
+			if len(clients) > 0 {
+				if c0, ok := clients[0].(map[string]any); ok {
+					if fl, _ := c0["flow"].(string); fl != "" {
+						nc["flow"] = fl
+					}
+				}
+			}
+			clients = append(clients, nc)
+		case "trojan", "hysteria2":
+			clients = append(clients, map[string]any{"password": randomHex(12), "email": email})
+		default:
+			return "", "", fmt.Errorf("协议 %v 暂不支持多客户端", ib["protocol"])
+		}
+		settings["clients"] = clients
+		newCfg, err := json.Marshal(cfg)
+		if err != nil {
+			return "", "", err
+		}
+		return email, string(newCfg), nil
+	}
+	return "", "", fmt.Errorf("入站不存在: %s", tag)
+}
+
+// removeClientFromInbound 从指定入站移除客户端。
+// 返回被移除的 email 与更新后的完整配置 JSON。
+func removeClientFromInbound(sv *storage.Server, tag, email string) (string, string, error) {
+	var cfg map[string]any
+	if sv.DesiredConfig == "" || json.Unmarshal([]byte(sv.DesiredConfig), &cfg) != nil {
+		return "", "", fmt.Errorf("该服务器还没有配置")
+	}
+	inbounds, _ := cfg["inbounds"].([]any)
+	for _, x := range inbounds {
+		ib, ok := x.(map[string]any)
+		if !ok || ib["tag"] != tag {
+			continue
+		}
+		settings, _ := ib["settings"].(map[string]any)
+		clients, _ := settings["clients"].([]any)
+		out := []any{}
+		removed := ""
+		for _, c := range clients {
+			if m, ok := c.(map[string]any); ok && m["email"] == email {
+				removed = email
+				continue
+			}
+			out = append(out, c)
+		}
+		if removed == "" {
+			return "", "", fmt.Errorf("客户端不存在: %s", email)
+		}
+		if len(out) == 0 {
+			return "", "", fmt.Errorf("至少保留一个客户端")
+		}
+		settings["clients"] = out
+		newCfg, err := json.Marshal(cfg)
+		if err != nil {
+			return "", "", err
+		}
+		return removed, string(newCfg), nil
+	}
+	return "", "", fmt.Errorf("入站不存在: %s", tag)
+}
+
+// applyConfigChange 保存+推送配置并重新同步订阅节点（管理操作公共出口）。
+func applyConfigChange(store *storage.Store, hub *master.Hub, sv *storage.Server, newConfig string) (int64, int, error) {
+	rev, err := store.SaveDesiredConfig(sv.ID, newConfig)
+	if err != nil {
+		return 0, 0, err
+	}
+	if err := hub.PushConfig(sv.ID, rev, newConfig); err != nil {
+		log.Printf("[Master] 服务器 %d 离线，配置将在上线后拉取 (rev=%d)", sv.ID, rev)
+	}
+	sv2, err := store.GetServer(sv.ID)
+	if err != nil {
+		return rev, 0, err
+	}
+	n, err := syncServerNodes(store, sv2)
+	return rev, n, err
+}
+
+// syncServerNodes 把服务器 desired_config 的入站转成订阅节点（幂等 delete+insert）。
+// 多用户入站：每个 client 生成一个节点，凭据归属各自面板用户（email 前缀匹配）；
+// 无法匹配面板用户的 client 进入全局池。
 func syncServerNodes(store *storage.Store, sv *storage.Server) (int, error) {
 	if strings.TrimSpace(sv.DesiredConfig) == "" {
 		store.ReplaceServerNodes(sv.ID, nil)
@@ -190,11 +347,7 @@ func syncServerNodes(store *storage.Store, sv *storage.Server) (int, error) {
 	host := publicHostOf(sv)
 	var nodes []*storage.Node
 	for _, ib := range cfg.Inbounds {
-		node, err := inboundToNode(ib, sv, host)
-		if err != nil {
-			continue // dokodemo/api 等非节点入站
-		}
-		nodes = append(nodes, node)
+		nodes = append(nodes, inboundToNodes(ib, sv, host, store)...)
 	}
 	if err := store.ReplaceServerNodes(sv.ID, nodes); err != nil {
 		return 0, err
@@ -217,8 +370,8 @@ func publicHostOf(sv *storage.Server) string {
 	return addr
 }
 
-// inboundToNode 把一个 xray inbound 转成订阅节点（生成分享 URI）。
-func inboundToNode(ib map[string]any, sv *storage.Server, host string) (*storage.Node, error) {
+// inboundToNodes 把一个 xray inbound 按客户端拆成订阅节点（每个 client 独立凭据）。
+func inboundToNodes(ib map[string]any, sv *storage.Server, host string, store *storage.Store) []*storage.Node {
 	proto, _ := ib["protocol"].(string)
 	tag, _ := ib["tag"].(string)
 	portF, _ := ib["port"].(float64)
@@ -227,102 +380,133 @@ func inboundToNode(ib map[string]any, sv *storage.Server, host string) (*storage
 	settings, _ := ib["settings"].(map[string]any)
 	stream, _ := ib["streamSettings"].(map[string]any)
 
-	n := &subparser.Node{Name: tag, Server: host, Port: port, Network: "tcp"}
-
-	getClient := func(key string) string {
-		if settings == nil {
-			return ""
-		}
-		clients, _ := settings["clients"].([]any)
-		if len(clients) == 0 {
-			return ""
-		}
-		c, _ := clients[0].(map[string]any)
-		v, _ := c[key].(string)
-		return v
-	}
-
 	sec, _ := stream["security"].(string)
 	net, _ := stream["network"].(string)
-	n.Network = net
 
-	switch proto {
-	case "vless":
-		n.Protocol = "vless"
-		n.UUID = getClient("id")
-		n.Flow = getClient("flow")
-	case "trojan":
-		n.Protocol = "trojan"
-		n.Password = getClient("password")
-		if sec == "" {
+	// 提取全部客户端（ss 协议无 clients 列表，视为单匿名用户）
+	type clientCred struct {
+		email string
+		cred  map[string]string
+	}
+	var clients []clientCred
+	clientsA, _ := settings["clients"].([]any)
+	for _, ca := range clientsA {
+		c, ok := ca.(map[string]any)
+		if !ok {
+			continue
+		}
+		cc := clientCred{cred: map[string]string{}}
+		cc.email, _ = c["email"].(string)
+		for _, k := range []string{"id", "password", "flow"} {
+			v, _ := c[k].(string)
+			cc.cred[k] = v
+		}
+		clients = append(clients, cc)
+	}
+	if proto == "shadowsocks" {
+		pw, _ := settings["password"].(string)
+		clients = []clientCred{{cred: map[string]string{"password": pw}}}
+	}
+	if len(clients) == 0 {
+		return nil // dokodemo/api 等非节点入站
+	}
+
+	multi := len(clients) > 1
+	var nodes []*storage.Node
+	for _, cc := range clients {
+		n := &subparser.Node{Name: tag, Server: host, Port: port, Network: "tcp"}
+		n.Network = net
+
+		switch proto {
+		case "vless":
+			n.Protocol = "vless"
+			n.UUID = cc.cred["id"]
+			n.Flow = cc.cred["flow"]
+		case "trojan":
+			n.Protocol = "trojan"
+			n.Password = cc.cred["password"]
+			if sec == "" {
+				sec = "tls"
+			}
+		case "shadowsocks":
+			n.Protocol = "ss"
+			n.Method, _ = settings["method"].(string)
+			n.Password = cc.cred["password"]
+		case "hysteria2":
+			n.Protocol = "hysteria2"
+			n.Password = cc.cred["password"]
 			sec = "tls"
+		default:
+			continue
 		}
-	case "shadowsocks":
-		n.Protocol = "ss"
-		method, _ := settings["method"].(string)
-		n.Method = method
-		n.Password, _ = settings["password"].(string)
-	case "hysteria2":
-		n.Protocol = "hysteria2"
-		n.Password = getClient("password")
-		sec = "tls"
-	default:
-		return nil, fmt.Errorf("跳过协议 %s", proto)
-	}
 
-	// TLS/Reality
-	switch sec {
-	case "tls":
-		n.Security = "tls"
-		if ts, ok := stream["tlsSettings"].(map[string]any); ok {
-			n.SNI, _ = ts["serverName"].(string)
-			if insecure, _ := ts["allowInsecure"].(bool); insecure {
-				n.SkipCert = true
+		// TLS/Reality（与入站共享，凭据无关）
+		switch sec {
+		case "tls":
+			n.Security = "tls"
+			if ts, ok := stream["tlsSettings"].(map[string]any); ok {
+				n.SNI, _ = ts["serverName"].(string)
+				if insecure, _ := ts["allowInsecure"].(bool); insecure {
+					n.SkipCert = true
+				}
+			}
+		case "reality":
+			n.Security = "reality"
+			if rs, ok := stream["realitySettings"].(map[string]any); ok {
+				if snis, _ := rs["serverNames"].([]any); len(snis) > 0 {
+					n.SNI, _ = snis[0].(string)
+				}
+				if sids, _ := rs["shortIds"].([]any); len(sids) > 0 {
+					n.Sid, _ = sids[0].(string)
+				}
+				priv, _ := rs["privateKey"].(string)
+				n.Pbk = deriveRealityPub(priv)
+				n.Fp = "chrome"
+			}
+			if n.Protocol == "vless" && n.Flow == "" {
+				n.Flow = "xtls-rprx-vision"
 			}
 		}
-	case "reality":
-		n.Security = "reality"
-		if rs, ok := stream["realitySettings"].(map[string]any); ok {
-			if snis, _ := rs["serverNames"].([]any); len(snis) > 0 {
-				n.SNI, _ = snis[0].(string)
+		if net == "ws" {
+			if ws, ok := stream["wsSettings"].(map[string]any); ok {
+				n.Path, _ = ws["path"].(string)
+				if hs, ok := ws["headers"].(map[string]any); ok {
+					n.Host, _ = hs["Host"].(string)
+				}
 			}
-			if sids, _ := rs["shortIds"].([]any); len(sids) > 0 {
-				n.Sid, _ = sids[0].(string)
-			}
-			priv, _ := rs["privateKey"].(string)
-			n.Pbk = deriveRealityPub(priv)
-			n.Fp = "chrome"
 		}
-		if n.Protocol == "vless" && n.Flow == "" {
-			n.Flow = "xtls-rprx-vision"
+		if n.SNI == "" && n.Host != "" {
+			n.SNI = n.Host
 		}
-	}
 
-	// WS 传输
-	if net == "ws" {
-		if ws, ok := stream["wsSettings"].(map[string]any); ok {
-			n.Path, _ = ws["path"].(string)
-			if hs, ok := ws["headers"].(map[string]any); ok {
-				n.Host, _ = hs["Host"].(string)
-			}
+		uri := subscribe.NodeURI(n)
+		if uri == "" {
+			continue
 		}
-	}
-	if n.SNI == "" && n.Host != "" {
-		n.SNI = n.Host
-	}
 
-	uri := subscribe.NodeURI(n)
-	if uri == "" {
-		return nil, fmt.Errorf("无法生成分享链接")
+		// 归属：email 前缀匹配面板用户 → 用户私有节点；否则全局池
+		owner := "__global__"
+		local := cc.email
+		if i := strings.Index(cc.email, "@"); i > 0 {
+			local = cc.email[:i]
+		}
+		if _, _, gerr := store.GetUser(local); gerr == nil {
+			owner = local
+		}
+		name := tag
+		if multi && local != "" {
+			name = tag + " · " + local
+		}
+		nodes = append(nodes, &storage.Node{
+			Username:     owner,
+			RawURL:       uri,
+			NodeName:     name,
+			Protocol:     n.Protocol,
+			Server:       host,
+			ParsedConfig: n.ToJSON(),
+			Enabled:      true,
+			Tag:          sv.Name,
+		})
 	}
-	return &storage.Node{
-		Username:     "__global__",
-		RawURL:       uri,
-		NodeName:     tag,
-		Protocol:     n.Protocol,
-		Server:       host,
-		ParsedConfig: n.ToJSON(),
-		Enabled:      true,
-		Tag:          sv.Name, // 标签=来源服务器名
-	}, nil
+	return nodes
 }
