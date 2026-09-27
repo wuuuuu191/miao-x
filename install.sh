@@ -30,8 +30,26 @@ log()  { echo -e "\033[32m[ miaowu ]\033[0m $*"; }
 warn() { echo -e "\033[33m[ miaowu ]\033[0m $*"; }
 die()  { echo -e "\033[31m[ miaowu ]\033[0m $*"; exit 1; }
 
-[[ $EUID -eq 0 ]] || die "请用 sudo 运行"
+[[ $EUID -eq 0 ]] || die "请用 sudo 运行（root 用户直接 bash install.sh 即可）"
 command -v systemctl >/dev/null 2>&1 || die "需要 systemd（Ubuntu/Debian/CentOS 等）"
+
+# 依赖预检：全新最小系统可能没有 curl，自动补装（Debian/Ubuntu/CentOS/Alpine）
+ensure_deps() {
+  command -v curl >/dev/null 2>&1 && return 0
+  warn "未检测到 curl，自动安装..."
+  if command -v apt-get >/dev/null 2>&1; then
+    apt-get update -y >/dev/null 2>&1 || true
+    apt-get install -y curl ca-certificates || true
+  elif command -v dnf >/dev/null 2>&1; then
+    dnf install -y curl || true
+  elif command -v yum >/dev/null 2>&1; then
+    yum install -y curl || true
+  elif command -v apk >/dev/null 2>&1; then
+    apk add curl ca-certificates || true
+  fi
+  command -v curl >/dev/null 2>&1 || die "curl 自动安装失败，请手动执行: apt-get install -y curl"
+}
+ensure_deps
 
 arch_of() {
   case "$(uname -m)" in
@@ -69,8 +87,10 @@ download() {
     done
   fi
   if [[ -s "$sums" ]]; then
+    # 防御：兼容 Windows 生成的 CRLF 清单
+    tr -d '\r' < "$sums" > "$sums.fix" && mv "$sums.fix" "$sums"
     local want got
-    want="$(grep -E "[0-9a-f]{64}  $(basename "$rel")\$" "$sums" | awk '{print $1}' | head -1)"
+    want="$(grep -E "[0-9a-f]{64}  $(basename "$rel")\$" "$sums" | awk '{print $1}' | head -1)" || want=""
     got="$(sha256sum "$out" | awk '{print $1}')"
     rm -f "$sums"
     if [[ -z "$want" ]]; then
@@ -198,6 +218,13 @@ EOF
              bash -c "$(curl -fsSL "$m/XTLS/Xray-install/raw/main/install-release.sh")" @ install && break
            done; } \
       || warn "xray 自动安装失败，请手动安装后: systemctl restart miaowu-agent"
+  fi
+  # 官方安装脚本会注册并启用 xray.service —— xray 进程由 miaowu-agent 托管，
+  # 系统服务必须停用，否则双进程抢端口/浪费内存
+  if systemctl list-unit-files xray.service --no-legend 2>/dev/null | grep -q .; then
+    systemctl stop xray 2>/dev/null || true
+    systemctl disable xray 2>/dev/null || true
+    log "已停用系统 xray.service（由 miaowu-agent 托管 xray）"
   fi
 
   write_systemd miaowu-agent "$INSTALL_DIR/agent" \
