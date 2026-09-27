@@ -1,0 +1,26 @@
+# 运行时数据（含数据库、Ed25519 主控私钥 —— 严禁入库）
+data/
+data-master/
+*/data/
+*.db
+*.db-shm
+*.db-wal
+master.key
+*.key
+
+# 构建产物
+miaowu.exe
+*.exe
+release/
+dist/
+
+# 日志与临时
+*.log
+*.err
+test-run/
+*.tmp
+
+# 编辑器
+.vscode/
+.idea/
+.zcode/
