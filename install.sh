@@ -111,7 +111,10 @@ install_bin() {
   local arch dest="$1"
   arch="$(arch_of)"
   log "下载 miaowu-linux-$arch ..."
-  download "miaowu-linux-$arch" "$dest"
+  # 先下临时文件再原子替换：目标可能是正在运行的主控二进制（同机部署 agent /
+  # 主控自升级场景），原地写入会报 Text file busy，rename 则不受限
+  download "miaowu-linux-$arch" "$dest.tmp"
+  mv -f "$dest.tmp" "$dest"
   chmod +x "$dest"
 }
 

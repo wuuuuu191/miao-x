@@ -131,12 +131,12 @@ func realityKeypair() string {
 	if err != nil {
 		panic(err) // crypto/rand 失败即环境异常
 	}
-	return base64.StdEncoding.EncodeToString(priv)
+	return base64.RawStdEncoding.EncodeToString(priv)
 }
 
 // deriveRealityPub 从配置中的 privateKey 推导 publicKey（同步器用）。
 func deriveRealityPub(privB64 string) string {
-	priv, err := base64.StdEncoding.DecodeString(privB64)
+	priv, err := base64.RawStdEncoding.DecodeString(strings.TrimRight(privB64, "="))
 	if err != nil || len(priv) != 32 {
 		return ""
 	}
@@ -144,7 +144,7 @@ func deriveRealityPub(privB64 string) string {
 	if err != nil {
 		return ""
 	}
-	return base64.StdEncoding.EncodeToString(pub)
+	return base64.RawStdEncoding.EncodeToString(pub)
 }
 
 func uuidV4() string {
